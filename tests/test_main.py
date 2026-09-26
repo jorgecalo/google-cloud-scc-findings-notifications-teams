@@ -1,0 +1,448 @@
+"""Unit tests for the SCC to Microsoft Teams Cloud Run function.
+
+Run from the repository root:
+    python -m venv .venv && . .venv/bin/activate
+    pip install -r app/scc-finding-teams-notifications/requirements.txt pytest
+    pytest
+"""
+
+import base64
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+import requests
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "app" / "scc-finding-teams-notifications"))
+sys.dont_write_bytecode = True
+
+import main  # noqa: E402
+
+FIXTURES = ROOT / "tests" / "fixtures"
+TEST_WEBHOOK_URL = "https://example.webhook.office.com/webhookb2/test-guid/IncomingWebhook/test-token/test-id"
+
+
+def load(name):
+    return json.loads((FIXTURES / name).read_text())
+
+
+@pytest.fixture
+def sha():
+    return load("sha_private_google_access.json")
+
+
+@pytest.fixture
+def etd():
+    return load("etd_v2_malware_bad_ip.json")
+
+
+def block_texts(blocks):
+    return [b["text"] for b in blocks if isinstance(b.get("text"), str)]
+
+
+def all_text(blocks):
+    return "\n".join(block_texts(blocks))
+
+
+# --- Formatting -------------------------------------------------------------
+
+def test_sha_finding_renders_all_sections(sha):
+    blocks = main.build_blocks(sha)
+    text = all_text(blocks)
+    assert "PRIVATE_GOOGLE_ACCESS_DISABLED" in text
+    assert "**Project**: example-project-01" in text
+    assert "⚠️" in text
+    assert "**Explanation:**" in text and "**Recommendation:**" in text
+    assert "`allow_private_google_access_disabled`" in text
+    # eventTime is preferred over createTime.
+    assert "2021-02-13T23:00:06.039628Z" in text
+    assert blocks[-1]["type"] == "ActionSet"
+    assert blocks[-1]["actions"][0]["type"] == "Action.OpenUrl"
+    assert blocks[-1]["actions"][0]["title"] == "View in Cloud Console"
+
+
+def test_no_placeholders_left(sha, etd):
+    for payload in (sha, etd):
+        dumped = json.dumps(main.build_blocks(payload))
+        for key in main.PLACEHOLDER_KEYS:
+            assert f"<{key}>" not in dumped
+
+
+def test_threat_finding_uses_description_and_next_steps(etd):
+    blocks = main.build_blocks(etd)
+    text = all_text(blocks)
+    assert "null" not in text
+    assert "known to be associated with malware" in text
+    assert "isolate it" in text
+    assert "**Instructions:**" not in text  # no ExceptionInstructions: block dropped
+    assert "🚨" in text
+    assert "**Resource**: web-frontend-1" in text
+
+
+def test_markdown_control_characters_are_escaped(etd):
+    text = all_text(main.build_blocks(etd))
+    assert "malware &amp; botnets &lt;C2&gt;" in text
+
+
+def test_missing_source_properties_does_not_crash(sha):
+    del sha["finding"]["sourceProperties"]
+    text = all_text(main.build_blocks(sha))
+    assert "**Explanation:**" not in text
+    assert "PRIVATE_GOOGLE_ACCESS_DISABLED" in text
+
+
+def test_missing_resource_and_category(sha):
+    del sha["resource"]
+    del sha["finding"]["category"]
+    text = all_text(main.build_blocks(sha))
+    assert "Unknown category" in text
+    assert "**Project**: n/a" in text
+
+
+def test_non_string_source_property(sha):
+    sha["finding"]["sourceProperties"]["Explanation"] = {"a": 1}
+    assert '{"a": 1}' in all_text(main.build_blocks(sha))
+
+
+def test_long_sections_are_truncated(sha):
+    sha["finding"]["sourceProperties"]["Recommendation"] = "x" * 5000
+    for text in block_texts(main.build_blocks(sha)):
+        assert len(text) <= main.TEAMS_SECTION_TEXT_LIMIT
+
+
+def test_template_is_not_mutated_between_calls(sha, etd):
+    main.build_blocks(sha)
+    second = all_text(main.build_blocks(etd))
+    assert "PRIVATE_GOOGLE_ACCESS_DISABLED" not in second
+
+
+# --- Console links ----------------------------------------------------------
+
+@pytest.mark.parametrize("name, expected", [
+    ("organizations/1/sources/2/findings/3", "organizationId=1"),
+    ("organizations/1/sources/2/locations/global/findings/3", "organizationId=1"),
+    ("projects/9/sources/2/findings/3", "project=9"),
+    ("folders/7/sources/2/locations/global/findings/3", "folder=7"),
+])
+def test_console_url_scopes(name, expected):
+    url = main.console_url(name)
+    assert expected in url
+    assert f"resourceId={name}" in url
+
+
+def test_console_url_handles_missing_name():
+    assert main.console_url(None) == main.CONSOLE_FINDINGS_URL
+
+
+# --- Project allowlist & CVE filtering -------------------------------------
+
+@pytest.fixture(autouse=True)
+def clear_cve_dedup_cache():
+    main._recent_cve_alerts_cache.clear()
+
+
+def make_cve_finding(
+    cve_id="CVE-2021-44228",
+    exploitability="WIDE",
+    impact="CRITICAL",
+    severity="CRITICAL",
+    project="example-project-01",
+):
+    return {
+        "finding": {
+            "name": f"organizations/111111111111/sources/222/findings/{cve_id}",
+            "state": "ACTIVE",
+            "severity": severity,
+            "findingClass": "VULNERABILITY",
+            "category": "SOFTWARE_VULNERABILITY",
+            "vulnerability": {
+                "cve": {
+                    "id": cve_id,
+                    "exploitationActivity": exploitability,
+                    "impact": impact,
+                    "upstreamFixAvailable": True,
+                    "cvssv3": {"baseScore": 9.8},
+                },
+                "offendingPackage": {"packageName": "openssl", "version": "3.0.0"},
+                "fixedPackage": {"packageName": "openssl", "version": "3.0.7"},
+            },
+        },
+        "resource": {"projectDisplayName": project},
+    }
+
+
+def test_allowlist_empty_allows_all(sha, monkeypatch):
+    monkeypatch.delenv("ALLOWED_PROJECTS", raising=False)
+    assert main.should_notify(sha)
+
+
+@pytest.mark.parametrize("value, allowed", [
+    ("example-project-01", True),
+    ("other, 222222222222", True),
+    ("other-project", False),
+])
+def test_allowlist(sha, monkeypatch, value, allowed):
+    monkeypatch.setenv("ALLOWED_PROJECTS", value)
+    assert main.should_notify(sha) is allowed
+
+
+@pytest.mark.parametrize("cve_id, exploitability, impact, expected", [
+    ("CVE-2021-44228", "WIDE", "CRITICAL", True),
+    ("CVE-2025-15467", "AVAILABLE", "HIGH", True),
+    ("CVE-2026-45447", "NO_KNOWN", "HIGH", False),
+    ("CVE-2022-23307", "ANTICIPATED", "CRITICAL", False),
+    ("CVE-2023-0001", "AVAILABLE", "MEDIUM", False),
+])
+def test_cve_exploitability_and_impact_filtering(cve_id, exploitability, impact, expected):
+    payload = make_cve_finding(cve_id=cve_id, exploitability=exploitability, impact=impact)
+    assert main.should_notify(payload) is expected
+
+
+def test_cve_organization_wide_deduplication():
+    first = make_cve_finding("CVE-2025-15467", "AVAILABLE", "HIGH", project="proj-1")
+    second_diff_proj = make_cve_finding("CVE-2025-15467", "AVAILABLE", "HIGH", project="proj-2")
+    assert main.should_notify(first) is True
+    assert main.should_notify(second_diff_proj) is False
+
+
+def test_cve_blocks_include_exploitability_and_impact():
+    payload = make_cve_finding("CVE-2021-44228", "WIDE", "CRITICAL")
+    text = all_text(main.build_blocks(payload))
+    assert "[WIDE EXPLOIT | CRITICAL IMPACT] CVE-2021-44228" in text
+    assert "**Exploitability**: **WIDE** | **Impact**: **CRITICAL**" in text
+    assert "Upgrade package openssl to 3.0.7." in text
+
+
+def test_gridtide_campaign_ioc_extraction_and_gti_enrichment(monkeypatch):
+    gridtide = load("etd_v2_gridtide_espionage.json")
+    iocs = main.extract_iocs(gridtide["finding"])
+    assert ("ip_addresses", "130.94.6.228") in iocs
+    assert ("domains", "1cv2f3d5s6a9w.ddnsfree.com") in iocs
+    assert ("files", "ce36a5fc44cbd7de947130b67be9e732a7b4086fb1df98a5afd724087c973b47") in iocs
+
+    monkeypatch.setenv("GTI_API_KEY", "dummy-gti-key")
+    monkeypatch.setattr(
+        main,
+        "query_gti_ioc",
+        lambda ioc_type, val, key, session=None: {
+            "ioc": val,
+            "type": ioc_type,
+            "label_type": {"ip_addresses": "IP", "domains": "Hostname", "files": "SHA256"}[ioc_type],
+            "verdict": "MALICIOUS",
+            "malicious": 35,
+            "suspicious": 0,
+            "total": 76,
+            "threat_score": 95,
+            "as_owner": "LIGHT NODE LIMITED",
+            "country": "VN",
+            "gui_url": f"https://www.virustotal.com/gui/search/{val}",
+        },
+    )
+    text = all_text(main.build_blocks(gridtide))
+    assert "Disrupting GRIDTIDE Global Espionage Campaign (UNC2814)" in text
+    assert "130.94.6.228" in text
+    assert "🔴 **MALICIOUS**" in text
+
+
+def test_log4shell_cve_gti_enrichment(monkeypatch):
+    log4shell = load("vuln_v2_log4shell_cve_2021_44228.json")
+    assert main.should_notify(log4shell) is True
+
+    monkeypatch.setenv("GTI_API_KEY", "dummy-gti-key")
+    monkeypatch.setattr(
+        main,
+        "query_gti_cve",
+        lambda cve_id, key, session=None: {
+            "cve_id": "CVE-2021-44228",
+            "risk_rating": "CRITICAL",
+            "exploitation_state": "Wide",
+            "priority": "P0",
+            "consequence": "Code Execution",
+            "cisa_kev": True,
+            "ransomware_use": "Known",
+            "epss_score": 0.99999,
+            "epss_percentile": 1.0,
+            "mitigations": ["Patch", "Workaround", "Firewall"],
+            "executive_summary": "An Input Validation vulnerability exists that allows arbitrary code execution.",
+            "mve_id": "MVE-2021-10855",
+            "gui_url": "https://www.virustotal.com/gui/collection/vulnerability--cve-2021-44228",
+        },
+    )
+    text = all_text(main.build_blocks(log4shell))
+    assert "[WIDE EXPLOIT | CRITICAL IMPACT] CVE-2021-44228" in text
+    assert "**GTIG Vulnerability Assessment**" in text
+    assert "Priority: `P0` | Impact: `Code Execution`" in text
+    assert "CISA KEV: `Yes`, Ransomware: `Known`" in text
+    assert "org.apache.logging.log4j:log4j-core to 2.17.1" in text
+
+
+def test_gti_enrichment_is_optional_when_api_key_unset(monkeypatch):
+    monkeypatch.delenv("GTI_API_KEY", raising=False)
+    for fixture_name in ("vuln_v2_log4shell_cve_2021_44228.json", "etd_v2_gridtide_espionage.json"):
+        payload = load(fixture_name)
+        blocks = main.build_blocks(payload)
+        text = all_text(blocks)
+        assert "Google Threat Intelligence (GTI) Verdict" not in text
+        for key in main.PLACEHOLDER_KEYS:
+            assert key not in text
+        assert len(blocks) <= 50
+
+
+# --- Microsoft Teams Webhook API handling -----------------------------------
+
+class FakeResponse:
+    def __init__(self, status=200, body="1", json_error=False):
+        self.status_code = status
+        self._body = body
+        self._json_error = json_error
+
+    @property
+    def text(self):
+        if isinstance(self._body, str):
+            return self._body
+        return json.dumps(self._body)
+
+    def json(self):
+        if self._json_error:
+            raise ValueError("no json")
+        if isinstance(self._body, str):
+            return json.loads(self._body)
+        return self._body
+
+
+class FakeSession:
+    def __init__(self, response=None, exc=None):
+        self.response, self.exc, self.calls = response, exc, []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.exc:
+            raise self.exc
+        return self.response
+
+
+def test_post_success_sends_expected_adaptive_card_payload(sha):
+    session = FakeSession(FakeResponse(status=202, body=""))
+    main.handle_notification(sha, webhook_url=f"{TEST_WEBHOOK_URL}\n", session=session)
+    url, kwargs = session.calls[0]
+    body = json.loads(kwargs["data"])
+    assert url == TEST_WEBHOOK_URL
+    assert kwargs["headers"]["Content-Type"] == "application/json; charset=utf-8"
+    assert kwargs["timeout"] == main.TEAMS_TIMEOUT_SECONDS
+    assert body["type"] == "message"
+    assert "PRIVATE_GOOGLE_ACCESS_DISABLED" in body["summary"]
+    attachment = body["attachments"][0]
+    assert attachment["contentType"] == "application/vnd.microsoft.card.adaptive"
+    card = attachment["content"]
+    assert card["type"] == "AdaptiveCard"
+    assert card["version"] == "1.4"
+    assert card["msteams"] == {"width": "Full"}
+    assert len(card["body"]) > 0
+
+
+@pytest.mark.parametrize("status, body", [
+    (400, "Bad Request: Summary or Text is required"),
+    (401, "Unauthorized"),
+    (404, "Webhook Not Found"),
+    (200, "Webhook message delivery failed with error: Microsoft Teams endpoint returned HTTP error 400"),
+    (200, {"ok": False, "error": "InvalidWebhookUrl"}),
+])
+def test_teams_permanent_errors_raise(sha, status, body):
+    session = FakeSession(FakeResponse(status, body))
+    with pytest.raises(main.PermanentError):
+        main.handle_notification(sha, webhook_url=TEST_WEBHOOK_URL, session=session)
+
+
+@pytest.mark.parametrize("response, exc", [
+    (FakeResponse(429, "Too Many Requests"), None),
+    (FakeResponse(503, "Service Unavailable"), None),
+    (FakeResponse(200, "Webhook message delivery failed with error: Microsoft Teams endpoint returned HTTP error 429"), None),
+    (FakeResponse(200, {"ok": False, "error": "ratelimited"}), None),
+    (None, requests.ConnectionError("boom")),
+])
+def test_transient_errors_raise(sha, response, exc):
+    with pytest.raises(main.TransientError):
+        main.handle_notification(sha, webhook_url=TEST_WEBHOOK_URL,
+                                 session=FakeSession(response, exc))
+
+
+def test_missing_or_insecure_configuration_is_permanent(sha, monkeypatch):
+    monkeypatch.delenv("TEAMS_WEBHOOK_URL", raising=False)
+    with pytest.raises(main.PermanentError):
+        main.handle_notification(sha, session=FakeSession(FakeResponse()))
+
+    with pytest.raises(main.PermanentError):
+        main.handle_notification(sha, webhook_url="http://insecure.example.com/webhook",
+                                 session=FakeSession(FakeResponse()))
+
+
+def test_skipped_project_does_not_call_teams(sha, monkeypatch):
+    monkeypatch.setenv("ALLOWED_PROJECTS", "other")
+    session = FakeSession(FakeResponse())
+    assert main.handle_notification(sha, webhook_url=TEST_WEBHOOK_URL, session=session) is False
+    assert session.calls == []
+
+
+# --- Entry point ------------------------------------------------------------
+
+class FakeCloudEvent(dict):
+    def __init__(self, data, time):
+        super().__init__(id="evt-1", time=time)
+        self.data = data
+
+
+def make_event(payload, age=timedelta(seconds=5)):
+    time = (datetime.now(timezone.utc) - age).isoformat().replace("+00:00", "Z")
+    data = {"message": {"data": base64.b64encode(json.dumps(payload).encode()).decode()}}
+    return FakeCloudEvent(data, time)
+
+
+@pytest.fixture
+def entry(monkeypatch):
+    fn = main._entry_point
+    monkeypatch.setenv("TEAMS_WEBHOOK_URL", TEST_WEBHOOK_URL)
+    monkeypatch.delenv("ALLOWED_PROJECTS", raising=False)
+    return fn
+
+
+def test_entry_point_posts(entry, sha, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "post_to_teams", lambda *a, **k: calls.append(a))
+    entry(make_event(sha))
+    assert len(calls) == 1
+
+
+def test_entry_point_reraises_transient(entry, sha, monkeypatch):
+    def fail(*a, **k):
+        raise main.TransientError("try again")
+    monkeypatch.setattr(main, "post_to_teams", fail)
+    with pytest.raises(main.TransientError):
+        entry(make_event(sha))
+
+
+def test_entry_point_swallows_permanent(entry, sha, monkeypatch, capsys):
+    def fail(*a, **k):
+        raise main.PermanentError("bad webhook")
+    monkeypatch.setattr(main, "post_to_teams", fail)
+    entry(make_event(sha))
+    assert '"severity": "ERROR"' in capsys.readouterr().out
+
+
+def test_entry_point_drops_old_events(entry, sha, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "post_to_teams", lambda *a, **k: calls.append(a))
+    entry(make_event(sha, age=timedelta(hours=2)))
+    assert calls == []
+
+
+def test_entry_point_bad_payload_is_not_retried(entry, capsys):
+    entry(FakeCloudEvent({"message": {"data": "not-base64!!"}}, datetime.now(timezone.utc).isoformat()))
+    assert "Permanent failure" in capsys.readouterr().out
+
+
+def test_functions_framework_entry_point_is_registered():
+    pytest.importorskip("functions_framework")
+    assert callable(main.send_teams_chat_notification)

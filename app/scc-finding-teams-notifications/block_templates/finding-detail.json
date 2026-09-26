@@ -1,0 +1,55 @@
+[
+    {
+        "type": "TextBlock",
+        "size": "Medium",
+        "weight": "Bolder",
+        "wrap": true,
+        "text": "A new security finding has been identified: [<SUBJECT>](<WEB_LINK>)"
+    },
+    {
+        "type": "TextBlock",
+        "wrap": true,
+        "text": "**Project**: <PROJECT_ID>  \n**Resource**: <RESOURCE>  \n**Severity**: **<SEVERITY>** <SEV_EMO>  \n**State**: <STATE>  \n**Event time**: <TIMESTAMP>"
+    },
+    {
+        "type": "TextBlock",
+        "separator": true,
+        "wrap": true,
+        "text": "<CVE_DETAILS>"
+    },
+    {
+        "type": "TextBlock",
+        "separator": true,
+        "wrap": true,
+        "text": "<GTI_DETAILS>"
+    },
+    {
+        "type": "TextBlock",
+        "separator": true,
+        "wrap": true,
+        "text": "**Explanation:**  \n<EXPLANATION>"
+    },
+    {
+        "type": "TextBlock",
+        "separator": true,
+        "wrap": true,
+        "text": "**Recommendation:**  \n<RECOMMENDATION>"
+    },
+    {
+        "type": "TextBlock",
+        "separator": true,
+        "wrap": true,
+        "text": "**Instructions:**  \n<INSTRUCT>"
+    },
+    {
+        "type": "ActionSet",
+        "separator": true,
+        "actions": [
+            {
+                "type": "Action.OpenUrl",
+                "title": "View in Cloud Console",
+                "url": "<WEB_LINK>"
+            }
+        ]
+    }
+]

@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is git ignored.
+
+org_id     = "123456789012"
+project_id = "my-security-project"
+# region   = "europe-west1"
+
+# Output crypto_key_id of the kms module.
+kms_crypto_key_id = "projects/my-security-project/locations/europe-west4/keyRings/scc-teams-notifier/cryptoKeys/teams-webhook-url"
+
+# Output of the encrypt_command in the kms module. Single line, base64.
+teams_webhook_url_ciphertext = "REPLACE-WITH-KMS-CIPHERTEXT-OF-TEAMS-WEBHOOK-URL"
+
+# Optional: Base64 KMS ciphertext of a Google Threat Intelligence (GTI) API key
+# to enrich CVE and IoC findings in Microsoft Teams. Leave unset/empty to disable GTI enrichment.
+# gti_api_key_ciphertext = "REPLACE-WITH-KMS-CIPHERTEXT-OF-GTI-API-KEY"
+
+# Optional: notify only on these projects. Empty means all projects.
+# allowed_projects = ["project-1", "project-2"]

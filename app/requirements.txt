@@ -1,6 +1,0 @@
-requests >=2.26.0
-json >=3.8.11
-
-### Requirements with minimum version
-google-cloud-secret-manager >= 2.2.0
-google-cloud-logging >= 2.2.0
