@@ -14,6 +14,37 @@
 
 Security Command Center (SCC) publishes active, unmuted HIGH and CRITICAL findings to a Pub/Sub topic. A Cloud Run function formats each finding with a Microsoft Teams Adaptive Card (v1.4) and posts it to your security channel via a Teams Workflows or Incoming Webhook URL. Everything is deployed with Terraform.
 
+### Component Overview
+
+```mermaid
+flowchart LR
+    Workloads["GCP Organization Workloads
+    (VMs, GKE, IAM, Networks, Data)"]
+    SCC["Security Command Center (v2)
+    (SHA, ETD, Vulnerability & Toxic Combinations)"]
+    PubSub["Cloud Pub/Sub
+    + Eventarc Trigger"]
+    Func["Cloud Run Function (2nd gen)
+    CVE Filter + Org Deduplication"]
+    GTI["Google Threat Intelligence (GTI)
+    (Optional CVE & IoC Verdicts)"]
+    KMS["Cloud KMS"]
+    SM["Secret Manager
+    (Teams Webhook URL & Optional GTI Key)"]
+    Teams["Microsoft Teams Channel
+    (Adaptive Card v1.4 Alert)"]
+
+    Workloads -->|Detects Finding| SCC
+    SCC -->|HIGH & CRITICAL Findings| PubSub
+    PubSub --> Func
+    GTI -.->|Optional CVE & IoC Enrichment| Func
+    KMS -.->|Decrypts at Deploy| SM
+    SM -.->|Injects Secrets| Func
+    Func -->|Workflows / Webhook POST| Teams
+```
+
+---
+
 ### What a notification looks like
 
 #### 1️⃣ Exploitable CVE Alert with GTI Vulnerability Intelligence (`CVE-2021-44228` Log4Shell)
@@ -207,12 +238,18 @@ See [Deployment](#-deployment) for the full steps and required permissions.
 
 ```mermaid
 flowchart LR
-    SCC["Security Command Center<br/>notification config (v2)"] -->|finding| PS["Pub/Sub topic"]
-    PS --> EA["Eventarc trigger"]
-    EA --> CF["Cloud Run function<br/>Python 3.13"]
-    SM["Secret Manager<br/>Teams webhook URL"] -.->|env var| CF
-    KMS["Cloud KMS"] -.->|decrypts at deploy time| SM
-    CF -->|Adaptive Card v1.4| MT["Microsoft Teams channel"]
+    SCC["Security Command Center
+    Notification Config (v2)"] -->|Finding| PS["Cloud Pub/Sub Topic"]
+    PS --> EA["Eventarc Trigger"]
+    EA --> CF["Cloud Run Function (2nd gen)
+    Python 3.13"]
+    GTI["Google Threat Intelligence
+    (Optional VirusTotal v3 API)"] -.->|CVE & IoC Enrichment| CF
+    SM["Secret Manager
+    (Teams Webhook URL & GTI Key)"] -.->|Secret Env Vars| CF
+    KMS["Cloud KMS"] -.->|Decrypts at Deploy Time| SM
+    CF -->|Adaptive Card v1.4| MT["Microsoft Teams Channel
+    (Workflows / Incoming Webhook)"]
 ```
 
 Deployment happens in two Terraform stages:
